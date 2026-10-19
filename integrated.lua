@@ -1,28 +1,75 @@
--- integrated.lua
--- Wrapper that loads the deepseek logic and provides a minimal in-game UI
--- to toggle common features. This intentionally uses a small custom UI so it
--- doesn't depend on the Cybrion UI file; it simply integrates control over
--- the runtime table created by the deepseek script.
+-- integrated.lua (updated loader)
+-- Robust wrapper that loads the deepseek logic and provides a minimal in-game UI
+-- to toggle common features. Improved HTTP/source validation and error messages.
 
 local DEEPSEEK_RAW = "https://raw.githubusercontent.com/souzadev4-max/VeteranoTeam-SintoniaRP-V2/main/deepseek_lua_20261019_817efb.lua"
 
--- Fetch and execute the deepseek script. It populates C.__VETERANO_SINTONIA_RUNTIME
--- and exposes functions on that runtime object.
-local ok, err = pcall(function()
-    local source = nil
-    local http = game:GetService("HttpService")
-    -- attempt to HttpGet; some exploit environments use different function names
-    local getter = (type(game.HttpGet) == "function" and function(u) return game:HttpGet(u) end)
-                 or (type(http.GetAsync) == "function" and function(u) return http:GetAsync(u) end)
-                 or (function(u) error("no http getter available") end)
-    source = getter(DEEPSEEK_RAW)
-    if not source or #source == 0 then error("empty source") end
-    local func, loadErr = loadstring(source)
-    if not func then error("loadstring failed: " .. tostring(loadErr)) end
-    pcall(func) -- run the deepseek script
-end)
-if not ok then
-    warn("[integrated.lua] failed to load deepseek script:", err)
+local function httpGet(url)
+    -- Try common getters. Some exploit envs expose different functions.
+    local getters = {
+        function(u) return (type(game.HttpGet) == "function") and game:HttpGet(u) end,
+        function(u) local hs = game:GetService("HttpService") if type(hs.GetAsync)=="function" then return hs:GetAsync(u) end end,
+        function(u) if type(http and http.request) == "function" then return http.request({Url=u, Method="GET"}).Body end end,
+    }
+    for _, g in ipairs(getters) do
+        local ok, res = pcall(g, url)
+        if ok and res and type(res) == "string" and #res > 0 then return res end
+    end
+    return nil, "no http getter available or all getters failed"
+end
+
+local function sanitizeSource(src)
+    if not src or type(src) ~= "string" then return src end
+    -- remove UTF-8 BOM
+    if src:sub(1,3) == '\239\187\191' then src = src:sub(4) end
+    -- normalize line endings
+    src = src:gsub('\r\n', '\n')
+    src = src:gsub('\r', '\n')
+    return src
+end
+
+local function looksLikeHtml(s)
+    if not s then return false end
+    local head = s:sub(1,300):lower()
+    return head:find("<html") or head:find("<!doctype html") or head:find("<meta") or head:find("https://github.com")
+end
+
+-- Try to download & load the deepseek script
+local source, getErr = httpGet(DEEPSEEK_RAW)
+if not source then
+    warn("[integrated.lua] http get failed: ", tostring(getErr))
+else
+    source = sanitizeSource(source)
+    if looksLikeHtml(source) then
+        warn("[integrated.lua] fetched content looks like HTML (not raw). Check the URL or GH rate limits. URL: "..DEEPSEEK_RAW)
+    else
+        -- attempt load using load or loadstring with safer error reporting
+        local loaded, loadErr
+        if type(load) == "function" then
+            loaded, loadErr = load(source)
+        elseif type(loadstring) == "function" then
+            loaded, loadErr = loadstring(source)
+        else
+            warn("[integrated.lua] no load/loadstring available in this environment")
+        end
+        if not loaded then
+            -- give a clearer hint: save a copy (if writefile available) and print load error
+            warn("[integrated.lua] load failed: ", tostring(loadErr))
+            if type(writefile) == "function" then
+                pcall(function() writefile("deepseek_debug.lua", source) end)
+                warn("[integrated.lua] source saved to deepseek_debug.lua via writefile for inspection")
+            end
+        else
+            local ok, rc = pcall(function() return loaded() end)
+            if not ok then
+                warn("[integrated.lua] error while running deepseek script: ", tostring(rc))
+                if type(writefile) == "function" then
+                    pcall(function() writefile("deepseek_runtime_error.lua", source) end)
+                    warn("[integrated.lua] source saved to deepseek_runtime_error.lua via writefile for inspection")
+                end
+            end
+        end
+    end
 end
 
 -- Wait for the runtime object created by the deepseek script
@@ -35,49 +82,51 @@ while tick() - start < timeout do
     task.wait(0.1)
 end
 if not runtime then
-    warn("[integrated.lua] could not find deepseek runtime (C.__VETERANO_SINTONIA_RUNTIME)")
-    return
+    warn("[integrated.lua] could not find deepseek runtime (C.__VETERANO_SINTONIA_RUNTIME). If the loader failed, run the deepseek script manually first, then run integrated.lua.")
+    -- continue anyway: we still create UI but toggles will only modify state when runtime appears
 end
 
-local state = runtime.state or runtime["state"] or runtime.T or runtime.o and runtime.o.state
-if not state and runtime.state == nil then
-    -- deepseek uses local T and then o.state = T; runtime.state exists in o
-    state = runtime.state
+local state = nil
+if runtime then
+    state = runtime.state or runtime["state"] or (runtime.o and runtime.o.state) or (getgenv and getgenv().__VETERANO_SINTONIA_RUNTIME and getgenv().__VETERANO_SINTONIA_RUNTIME.state)
 end
 
--- Helper: safely toggle boolean flags in the runtime state
 local function setFlag(key, value)
     pcall(function()
         if state then state[key] = value end
+        -- also try common paths
+        if runtime and runtime.state == nil and runtime.o and runtime.o.state then runtime.o.state[key] = value end
+        if getgenv and getgenv().__VETERANO_SINTONIA_RUNTIME and getgenv().__VETERANO_SINTONIA_RUNTIME.state then
+            getgenv().__VETERANO_SINTONIA_RUNTIME.state[key] = value
+        end
     end)
 end
 local function getFlag(key)
-    local ok, v = pcall(function() return state and state[key] end)
+    local ok, v = pcall(function()
+        if state and state[key] ~= nil then return state[key] end
+        if runtime and runtime.o and runtime.o.state and runtime.o.state[key] ~= nil then return runtime.o.state[key] end
+        if getgenv and getgenv().__VETERANO_SINTONIA_RUNTIME and getgenv().__VETERANO_SINTONIA_RUNTIME.state then return getgenv().__VETERANO_SINTONIA_RUNTIME.state[key] end
+        return nil
+    end)
     if ok then return v end
     return nil
 end
 
--- Exposed runtime functions (if present)
-local startGhost = runtime.startGhost or runtime.StartGhost or (runtime.o and runtime.o.startGhost)
-local stopGhost = runtime.stopGhost or runtime.StopGhost or (runtime.o and runtime.o.stopGhost)
-local startAutoColeta = runtime.startAutoColeta or (runtime.o and runtime.o.startAutoColeta)
-local stopAutoColeta = runtime.stopAutoColeta or (runtime.o and runtime.o.stopAutoColeta)
-local iniciarFarmPartes = runtime.iniciarFarmPartes or (runtime.o and runtime.o.iniciarFarmPartes)
-local pararFarmPartes = runtime.pararFarmPartes or (runtime.o and runtime.o.pararFarmPartes)
+local startGhost = runtime and (runtime.startGhost or runtime.StartGhost or (runtime.o and runtime.o.startGhost))
+local stopGhost = runtime and (runtime.stopGhost or runtime.StopGhost or (runtime.o and runtime.o.stopGhost))
+local startAutoColeta = runtime and (runtime.startAutoColeta or (runtime.o and runtime.o.startAutoColeta))
+local stopAutoColeta = runtime and (runtime.stopAutoColeta or (runtime.o and runtime.o.stopAutoColeta))
+local iniciarFarmPartes = runtime and (runtime.iniciarFarmPartes or (runtime.o and runtime.o.iniciarFarmPartes))
+local pararFarmPartes = runtime and (runtime.pararFarmPartes or (runtime.o and runtime.o.pararFarmPartes))
 
--- Create a simple ScreenGui with toggles
+-- Create UI
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
-if not LocalPlayer then
-    warn("[integrated.lua] LocalPlayer not ready")
-    return
-end
+if not LocalPlayer then warn("[integrated.lua] LocalPlayer not ready") return end
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "VeteranoIntegratedUI"
-if syn and syn.protect_gui then
-    pcall(syn.protect_gui, gui)
-end
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
 
 gui.ResetOnSpawn = false
 local parent = LocalPlayer:FindFirstChild("PlayerGui") or game:GetService("CoreGui")
@@ -89,9 +138,7 @@ frame.Position = UDim2.new(0, 20, 0, 80)
 frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 frame.BorderSizePixel = 0
 frame.Parent = gui
-
-local uiCorner = Instance.new("UICorner", frame)
-uiCorner.CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 32)
@@ -140,9 +187,7 @@ local function makeToggle(labelText, key, onActivateFunc, onDeactivateFunc)
     btn.MouseButton1Click:Connect(function()
         local cur = getFlag(key)
         local new = not cur
-        -- set in state
         setFlag(key, new)
-        -- call specific functions if provided
         if new and type(onActivateFunc) == "function" then pcall(onActivateFunc) end
         if not new and type(onDeactivateFunc) == "function" then pcall(onDeactivateFunc) end
         update()
@@ -153,35 +198,24 @@ local function makeToggle(labelText, key, onActivateFunc, onDeactivateFunc)
     return lbl, btn
 end
 
--- toggles: ESP, Fly, Noclip, Ghost, AutoColeta, FarmPartes, Aimbot, Fullbright
 makeToggle("ESP", "espEnabled")
 makeToggle("Fly", "flyEnabled")
 makeToggle("Noclip", "noclipEnabled")
-
--- Ghost needs special handling to call startGhost/stopGhost when available
 makeToggle("Ghost", "ghostEnabled",
-    function() -- activate
-        if startGhost then pcall(startGhost) end
-    end,
-    function() -- deactivate
-        if stopGhost then pcall(stopGhost) end
-    end
+    function() if startGhost then pcall(startGhost) end end,
+    function() if stopGhost then pcall(stopGhost) end end
 )
-
 makeToggle("AutoColeta", "autoColetaEnabled",
     function() if startAutoColeta then pcall(startAutoColeta) end end,
     function() if stopAutoColeta then pcall(stopAutoColeta) end end
 )
-
 makeToggle("FarmPartes", "farmPartesEnabled",
     function() if iniciarFarmPartes then pcall(iniciarFarmPartes) end end,
     function() if pararFarmPartes then pcall(pararFarmPartes) end end
 )
-
 makeToggle("Aimbot", "aimbotEnabled")
 makeToggle("Fullbright/NoLag", "fullbright")
 
--- Small status label
 local status = Instance.new("TextLabel")
 status.Size = UDim2.new(1, -16, 0, 28)
 status.Position = UDim2.new(0, 8, 1, -40)
@@ -192,17 +226,8 @@ status.Font = Enum.Font.SourceSansItalic
 status.TextSize = 13
 status.Parent = frame
 
--- Auto-refresh the toggle states every 0.5s in case other scripts change them
 spawn(function()
     while gui.Parent do
-        for _, child in ipairs(frame:GetChildren()) do
-            if child:IsA("TextButton") then
-                -- try to find corresponding label text to deduce key by position
-                -- no strong mapping stored, so simply update by reading button.Text from state
-                -- this is a lightweight approach: update button appearance by reading a mapping
-            end
-        end
-        -- update status with some runtime info
         pcall(function()
             local sc = ""
             if runtime and runtime.staffCount then sc = string.format(" | staff=%d", runtime.staffCount) end
